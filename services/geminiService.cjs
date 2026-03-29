@@ -1,0 +1,985 @@
+const axios = require("axios");
+const cheerio = require("cheerio");
+
+// === Config ===
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent";
+
+// Determine which API to use
+const USE_VERTEX_AI = !!(GEMINI_PROJECT_ID && GEMINI_LOCATION);
+
+// Vertex AI endpoint
+const VERTEX_AI_BASE_URL = `https://${GEMINI_LOCATION}-aiplatform.googleapis.com/v1/projects/${GEMINI_PROJECT_ID}/locations/${GEMINI_LOCATION}/publishers/google/models/gemini-1.5-flash:generateContent`;
+
+// Gemini API base URL (using Google AI Studio API)
+const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent';
+
+// Initialize Google Auth for Vertex AI (only if needed)
+let authClient = null;
+if (USE_VERTEX_AI) {
+  try {
+    // Support both service account JSON file and application default credentials
+    const serviceAccountPath = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+    const serviceAccountJson = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
+    
+    if (serviceAccountJson) {
+      // Use service account JSON from environment variable
+      try {
+        const serviceAccount = JSON.parse(serviceAccountJson);
+        authClient = new GoogleAuth({
+          credentials: serviceAccount,
+          scopes: ['https://www.googleapis.com/auth/cloud-platform'],
+        });
+        console.log('✅ Vertex AI authentication initialized from GOOGLE_APPLICATION_CREDENTIALS_JSON');
+      } catch (parseError) {
+        console.warn('⚠️ Failed to parse GOOGLE_APPLICATION_CREDENTIALS_JSON:', parseError.message);
+      }
+    } else if (serviceAccountPath) {
+      // Use service account JSON file path
+      authClient = new GoogleAuth({
+        keyFilename: serviceAccountPath,
+        scopes: ['https://www.googleapis.com/auth/cloud-platform'],
+      });
+      console.log(`✅ Vertex AI authentication initialized from file: ${serviceAccountPath}`);
+    } else {
+      // Try application default credentials (requires gcloud auth or env var)
+      authClient = new GoogleAuth({
+        scopes: ['https://www.googleapis.com/auth/cloud-platform'],
+      });
+      console.log('✅ Vertex AI authentication initialized (using application default credentials)');
+      console.log('   Note: Make sure you have run: gcloud auth application-default login');
+    }
+  } catch (error) {
+    console.warn('⚠️ Google Auth initialization failed:', error.message);
+    console.warn('   Options to fix:');
+    console.warn('   1. Set GOOGLE_APPLICATION_CREDENTIALS_JSON with service account JSON');
+    console.warn('   2. Set GOOGLE_APPLICATION_CREDENTIALS to path of service account JSON file');
+    console.warn('   3. Run: gcloud auth application-default login');
+    console.warn('   The service will use mock responses until authentication is configured.');
+    authClient = null; // Ensure it's null so we know auth failed
+  }
+} else if (!GEMINI_API_KEY) {
+  console.log('ℹ️  No API credentials configured. Using intelligent mock responses.');
+  console.log('   To use real AI: Set GEMINI_PROJECT_ID + GEMINI_LOCATION (for Vertex AI) or GEMINI_API_KEY (for Gemini API)');
+}
+
+/**
+ * System prompt for startup analysis
+ */
+const ANALYSIS_SYSTEM_PROMPT = `You are an AI startup analyst with expertise in venture capital and early-stage investing. 
+
+Your task is to analyze founder materials and public data to produce investor-style insights. 
+
+Given the provided startup information, generate a comprehensive analysis that includes:
+
+1. **Summary**: A concise 2-3 sentence overview of the startup, its business model, and key value proposition
+2. **Strengths**: 3-5 specific strengths or positive indicators (market opportunity, team, technology, traction, etc.)
+3. **Risks**: 3-5 specific risks or concerns (market size, competition, execution risk, financial concerns, etc.)
+4. **Next Steps**: 3-5 actionable next steps for due diligence or investment consideration
+5. **Deal Score**: A numerical score from 0-10 (10 being exceptional investment opportunity)
+
+Be specific, data-driven, and provide actionable insights. Focus on what matters most to early-stage investors.
+
+Respond ONLY with valid JSON in this exact format:
+{
+  "summary": "string",
+  "strengths": ["string1", "string2", "string3"],
+  "risks": ["string1", "string2", "string3"],
+  "nextSteps": ["string1", "string2", "string3"],
+  "dealScore": number
+}`;
+
+/**
+ * System prompt for chat interactions
+ */
+const CHAT_SYSTEM_PROMPT = `You are an AI startup analyst assistant. You help investors and entrepreneurs with startup analysis, market insights, and investment evaluation.
+
+You have access to startup data and can provide:
+- Detailed analysis of startup opportunities
+- Market insights and competitive analysis
+- Risk assessment and mitigation strategies
+- Due diligence guidance
+- Investment thesis development
+
+Be helpful, professional, and provide actionable insights. If you don't have enough information to answer a question, ask for clarification.
+
+Keep responses concise but comprehensive.`;
+
+/**
+ * Scrapes text content from public URLs
+ */
+async function scrapePublicUrls(urls) {
+  if (!urls || urls.length === 0) return '';
+  
+  const cheerio = require('cheerio');
+  let scrapedText = '';
+  
+  for (const url of urls) {
+    try {
+      const res = await axios.get(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+      const $ = cheerio.load(res.data);
+      $("script, style, noscript").remove();
+      const content = $("body").text().replace(/\s+/g, " ").slice(0, 2000);
+      text += `\n\n--- ${url} ---\n${content}...`;
+    } catch (err) {
+      console.error(`Scraping failed for ${url}:`, err.message);
+      text += `\n\n--- ${url} --- [Scraping failed]`;
+    }
+  }
+  return text;
+}
+
+/**
+ * Calls Gemini API (Vertex AI or Google AI Studio) for startup analysis
+ */
+async function callGeminiAPI(prompt, systemPrompt) {
+  const requestBody = {
+    contents: [{
+      parts: [{
+        text: `${systemPrompt}\n\n${prompt}`
+      }]
+    }],
+    generationConfig: {
+      temperature: 0.7,
+      topK: 40,
+      topP: 0.95,
+      maxOutputTokens: 2048,
+    }
+  };
+  
+  let url;
+  let headers = {
+        'Content-Type': 'application/json'
+  };
+  
+  // Use Vertex AI if project ID and location are configured
+  if (USE_VERTEX_AI) {
+    if (!authClient) {
+      throw new Error('Vertex AI credentials not properly configured. Please run: gcloud auth application-default login');
+    }
+    
+    url = VERTEX_AI_BASE_URL;
+    try {
+      const accessToken = await getAccessToken();
+      headers['Authorization'] = `Bearer ${accessToken}`;
+      console.log('🔐 Using Vertex AI endpoint - Authentication successful');
+    } catch (authError) {
+      console.error('❌ Vertex AI authentication failed:', authError.message);
+      throw new Error(`Vertex AI authentication failed: ${authError.message}. Please run: gcloud auth application-default login`);
+    }
+  } else if (GEMINI_API_KEY) {
+    // Fall back to Gemini API (Google AI Studio)
+    url = `${GEMINI_BASE_URL}?key=${GEMINI_API_KEY}`;
+    console.log('🔑 Using Gemini API (Google AI Studio)');
+  } else {
+    throw new Error('No API credentials configured. Please set GEMINI_API_KEY or GEMINI_PROJECT_ID + GEMINI_LOCATION');
+  }
+  
+  try {
+    const response = await axios.post(url, requestBody, {
+      headers,
+      timeout: 60000 // 60 seconds for Vertex AI
+    });
+    
+    // Handle the response (same format for both APIs)
+    let fullText = '';
+    
+    if (response.data && response.data.candidates && response.data.candidates[0]) {
+      if (response.data.candidates[0].content && response.data.candidates[0].content.parts) {
+        for (const part of response.data.candidates[0].content.parts) {
+          if (part.text) {
+            fullText += part.text;
+          }
+        }
+      }
+    }
+    
+    if (fullText.trim()) {
+      return fullText.trim();
+    } else {
+      console.log('Full response:', JSON.stringify(response.data, null, 2));
+      throw new Error('No text content found in API response');
+    }
+    
+  } catch (error) {
+    console.error('API error:', error.response?.data || error.message);
+    
+    if (USE_VERTEX_AI && error.response?.status === 401) {
+      throw new Error('Vertex AI authentication failed. Please run: gcloud auth application-default login');
+    }
+    
+    throw new Error(`API call failed: ${error.message}`);
+  }
+}
+
+/**
+ * Extract structured analysis from AI text response (fallback parser)
+ */
+function extractAnalysisFromText(text, startupName) {
+  try {
+    const analysis = {
+      summary: '',
+      strengths: [],
+      risks: [],
+      nextSteps: [],
+      dealScore: 5
+    };
+    
+    // Try to extract summary
+    const summaryMatch = text.match(/(?:summary|overview)[:\-]?\s*(.+?)(?=\n\n|\n(?:strengths|risks|next steps|deal score)|$)/is);
+    if (summaryMatch) {
+      analysis.summary = summaryMatch[1].trim();
+    } else {
+      // Fallback: use first paragraph
+      analysis.summary = text.split('\n\n')[0] || `Analysis of ${startupName}`;
+    }
+    
+    // Try to extract strengths (look for list items or numbered points)
+    const strengthsSection = text.match(/(?:strengths?)[:\-]?\s*(.+?)(?=\n\n|\n(?:risks|next steps|deal score|concerns)|$)/is);
+    if (strengthsSection) {
+      const strengthsText = strengthsSection[1];
+      const strengthItems = strengthsText.match(/(?:[-•*]\s*|\d+\.\s*)(.+?)(?=\n[-•*\d]|$)/g);
+      if (strengthItems) {
+        analysis.strengths = strengthItems.map(item => item.replace(/^[-•*\d.\s]+/, '').trim()).filter(s => s.length > 10);
+      }
+    }
+    
+    // Try to extract risks
+    const risksSection = text.match(/(?:risks?|concerns?)[:\-]?\s*(.+?)(?=\n\n|\n(?:next steps|deal score|strengths)|$)/is);
+    if (risksSection) {
+      const risksText = risksSection[1];
+      const riskItems = risksText.match(/(?:[-•*]\s*|\d+\.\s*)(.+?)(?=\n[-•*\d]|$)/g);
+      if (riskItems) {
+        analysis.risks = riskItems.map(item => item.replace(/^[-•*\d.\s]+/, '').trim()).filter(s => s.length > 10);
+      }
+    }
+    
+    // Try to extract next steps
+    const nextStepsSection = text.match(/(?:next steps?|recommendations?)[:\-]?\s*(.+?)(?=\n\n|\n(?:deal score|strengths|risks)|$)/is);
+    if (nextStepsSection) {
+      const nextStepsText = nextStepsSection[1];
+      const nextStepItems = nextStepsText.match(/(?:[-•*]\s*|\d+\.\s*)(.+?)(?=\n[-•*\d]|$)/g);
+      if (nextStepItems) {
+        analysis.nextSteps = nextStepItems.map(item => item.replace(/^[-•*\d.\s]+/, '').trim()).filter(s => s.length > 10);
+      }
+    }
+    
+    // Try to extract deal score
+    const scoreMatch = text.match(/(?:deal\s*score|score|rating)[:\-]?\s*(\d+(?:\.\d+)?)\s*(?:\/\s*10|out\s*of\s*10)?/i);
+    if (scoreMatch) {
+      analysis.dealScore = parseFloat(scoreMatch[1]);
+    }
+    
+    return analysis;
+  } catch (error) {
+    console.error('Error extracting analysis from text:', error);
+    return null;
+  }
+}
+
+/**
+ * Generate sophisticated summary based on startup data
+ */
+function generateSummary(startupName, industry, industryContext, actualRevenue, userCount, teamSize, hasDeckText, hasTranscript, hasPublicData) {
+  let summary = `${startupName} operates in the ${industry} sector. `;
+  
+  if (actualRevenue > 0) {
+    const revenueText = actualRevenue >= 1000000000 ? `$${(actualRevenue/1000000000).toFixed(1)}B` :
+                       actualRevenue >= 1000000 ? `$${(actualRevenue/1000000).toFixed(1)}M` :
+                       actualRevenue >= 1000 ? `$${(actualRevenue/1000).toFixed(1)}K` : `$${actualRevenue}`;
+    summary += `The company demonstrates strong revenue generation with ${revenueText} in annual revenue. `;
+  }
+  
+  if (userCount > 0) {
+    const userText = userCount >= 1000000 ? `${(userCount/1000000).toFixed(1)}M` :
+                     userCount >= 1000 ? `${(userCount/1000).toFixed(1)}K` : userCount.toString();
+    summary += `With ${userText} users, the platform shows significant market traction. `;
+  }
+  
+  if (teamSize > 0) {
+    summary += `The ${teamSize}-person team provides a solid foundation for execution. `;
+  }
+  
+  summary += industryContext + " ";
+  
+  const dataQuality = [hasDeckText, hasTranscript, hasPublicData].filter(Boolean).length;
+  if (dataQuality === 3) {
+    summary += "Comprehensive data analysis reveals strong fundamentals and market positioning.";
+  } else if (dataQuality === 2) {
+    summary += "Good data coverage enables solid investment thesis development.";
+  } else {
+    summary += "Additional data would strengthen the investment analysis.";
+  }
+  
+  return summary;
+}
+
+/**
+ * Generate strengths based on startup metrics and data
+ */
+function generateStrengths(industry, actualRevenue, userCount, teamSize, growthRate, funding, techStack, marketMention, hasDeckText, hasTranscript, hasPublicData) {
+  const strengths = [];
+  
+  if (actualRevenue > 1000000) {
+    strengths.push(`Strong revenue generation with $${(actualRevenue/1000000).toFixed(1)}M+ annual revenue`);
+  } else if (actualRevenue > 0) {
+    strengths.push(`Early revenue traction with $${(actualRevenue/1000).toFixed(1)}K+ annual revenue`);
+  }
+  
+  if (userCount > 100000) {
+    strengths.push(`Significant user base with ${(userCount/1000).toFixed(0)}K+ active users`);
+  } else if (userCount > 1000) {
+    strengths.push(`Growing user base with ${userCount.toLocaleString()} users`);
+  }
+  
+  if (teamSize > 10) {
+    strengths.push(`Experienced team of ${teamSize} professionals with execution capability`);
+  } else if (teamSize > 0) {
+    strengths.push(`Lean team of ${teamSize} members with focused execution`);
+  }
+  
+  if (growthRate) {
+    strengths.push(`Strong growth momentum with ${growthRate} growth rate`);
+  }
+  
+  if (funding) {
+    strengths.push(`Previous funding validation: ${funding}`);
+  }
+  
+  if (techStack.length > 0) {
+    strengths.push(`Modern technology stack leveraging ${techStack.join(', ')}`);
+  }
+  
+  if (marketMention) {
+    strengths.push(`Large addressable market opportunity identified`);
+  }
+  
+  if (hasDeckText) {
+    strengths.push("Comprehensive pitch deck with clear business model");
+  }
+  
+  if (hasTranscript) {
+    strengths.push("Founder interviews demonstrate strategic vision");
+  }
+  
+  if (hasPublicData) {
+    strengths.push("Public data validates market presence and traction");
+  }
+  
+  // Industry-specific strengths
+  if (industry === "SaaS") {
+    strengths.push("Recurring revenue model with predictable cash flow");
+  } else if (industry === "fintech") {
+    strengths.push("High-margin financial services with regulatory moats");
+  } else if (industry === "healthcare") {
+    strengths.push("Mission-critical healthcare solutions with high switching costs");
+  }
+  
+  return strengths.slice(0, 5); // Limit to 5 strengths
+}
+
+/**
+ * Generate risks based on startup metrics and data
+ */
+function generateRisks(industry, actualRevenue, userCount, teamSize, hasDeckText, hasTranscript, hasPublicData) {
+  const risks = [];
+  
+  if (actualRevenue === 0) {
+    risks.push("No revenue validation - unproven business model");
+  } else if (actualRevenue < 100000) {
+    risks.push("Limited revenue scale - early-stage financial validation needed");
+  }
+  
+  if (userCount === 0) {
+    risks.push("No user traction - product-market fit unproven");
+  } else if (userCount < 1000) {
+    risks.push("Limited user base - scalability concerns");
+  }
+  
+  if (teamSize === 0) {
+    risks.push("No team information - execution risk unclear");
+  } else if (teamSize < 5) {
+    risks.push("Small team size - execution capacity limitations");
+  }
+  
+  if (!hasDeckText) {
+    risks.push("Incomplete pitch deck - business model clarity needed");
+  }
+  
+  if (!hasTranscript) {
+    risks.push("No founder interview - team assessment incomplete");
+  }
+  
+  if (!hasPublicData) {
+    risks.push("Limited public validation - market presence unclear");
+  }
+  
+  // Industry-specific risks
+  if (industry === "fintech") {
+    risks.push("Regulatory compliance challenges and changing financial regulations");
+  } else if (industry === "healthcare") {
+    risks.push("Long sales cycles and complex regulatory approval processes");
+  } else if (industry === "food delivery") {
+    risks.push("High operational complexity and customer acquisition costs");
+  } else if (industry === "SaaS") {
+    risks.push("Intense competition and customer churn risks");
+  }
+  
+  risks.push("Market competition and differentiation challenges");
+  risks.push("Execution risk and scaling challenges");
+  
+  return risks.slice(0, 5); // Limit to 5 risks
+}
+
+/**
+ * Generate next steps based on data completeness and industry
+ */
+function generateNextSteps(industry, hasDeckText, hasTranscript, hasPublicData, actualRevenue, userCount) {
+  const nextSteps = [];
+  
+  if (!hasDeckText) {
+    nextSteps.push("Review comprehensive pitch deck and financial projections");
+  }
+  
+  if (!hasTranscript) {
+    nextSteps.push("Conduct founder interviews to assess team and vision");
+  }
+  
+  if (!hasPublicData) {
+    nextSteps.push("Gather public data and market validation metrics");
+  }
+  
+  if (actualRevenue === 0) {
+    nextSteps.push("Validate revenue model and unit economics");
+  } else {
+    nextSteps.push("Conduct detailed financial analysis and growth projections");
+  }
+  
+  if (userCount === 0) {
+    nextSteps.push("Assess product-market fit and user acquisition strategy");
+  } else {
+    nextSteps.push("Analyze user growth metrics and retention rates");
+  }
+  
+  nextSteps.push("Perform competitive analysis and market positioning review");
+  nextSteps.push("Evaluate technical architecture and scalability plans");
+  nextSteps.push("Assess go-to-market strategy and customer acquisition costs");
+  
+  // Industry-specific next steps
+  if (industry === "fintech") {
+    nextSteps.push("Review regulatory compliance and licensing requirements");
+  } else if (industry === "healthcare") {
+    nextSteps.push("Assess FDA approval pathway and clinical validation");
+  }
+  
+  return nextSteps.slice(0, 5); // Limit to 5 next steps
+}
+
+/**
+ * Calculate deal score based on multiple factors
+ */
+function calculateDealScore(actualRevenue, userCount, teamSize, hasDeckText, hasTranscript, hasPublicData, growthRate, funding) {
+  let score = 5; // Base score
+  
+  // Revenue scoring
+  if (actualRevenue >= 10000000) score += 2;
+  else if (actualRevenue >= 1000000) score += 1.5;
+  else if (actualRevenue >= 100000) score += 1;
+  else if (actualRevenue > 0) score += 0.5;
+  
+  // User base scoring
+  if (userCount >= 1000000) score += 2;
+  else if (userCount >= 100000) score += 1.5;
+  else if (userCount >= 10000) score += 1;
+  else if (userCount > 0) score += 0.5;
+  
+  // Team scoring
+  if (teamSize >= 20) score += 1.5;
+  else if (teamSize >= 10) score += 1;
+  else if (teamSize >= 5) score += 0.5;
+  
+  // Data quality scoring
+  const dataQuality = [hasDeckText, hasTranscript, hasPublicData].filter(Boolean).length;
+  score += dataQuality * 0.5;
+  
+  // Growth and funding bonuses
+  if (growthRate) score += 0.5;
+  if (funding) score += 1;
+  
+  // Cap the score between 1-10
+  return Math.max(1, Math.min(10, Math.round(score)));
+}
+
+/**
+ * Generate Risk MRI Analysis based on startup data
+ */
+function generateRiskMRIAnalysis(industry, actualRevenue, userCount, teamSize, hasDeckText, hasTranscript, hasPublicData, growthRate, funding) {
+  const riskCategories = [
+    {
+      name: "Team",
+      score: calculateTeamRisk(teamSize, hasTranscript),
+      description: generateTeamRiskDescription(teamSize, hasTranscript)
+    },
+    {
+      name: "Market",
+      score: calculateMarketRisk(industry, userCount, hasPublicData),
+      description: generateMarketRiskDescription(industry, userCount, hasPublicData)
+    },
+    {
+      name: "Product",
+      score: calculateProductRisk(actualRevenue, userCount, hasDeckText),
+      description: generateProductRiskDescription(actualRevenue, userCount, hasDeckText)
+    },
+    {
+      name: "Traction",
+      score: calculateTractionRisk(actualRevenue, userCount, growthRate),
+      description: generateTractionRiskDescription(actualRevenue, userCount, growthRate)
+    },
+    {
+      name: "Moat",
+      score: calculateMoatRisk(industry, actualRevenue, userCount, hasDeckText),
+      description: generateMoatRiskDescription(industry, actualRevenue, userCount, hasDeckText)
+    }
+  ];
+  
+  const overallRiskScore = riskCategories.reduce((sum, cat) => sum + cat.score, 0) / riskCategories.length;
+  
+  return {
+    summary: "No summary available.",
+    strengths: [],
+    risks: [],
+    nextSteps: [],
+    dealScore: 0,
+    riskMRI: {
+      categories: [
+        { name: "Team", score: 0, description: "Not analyzed" },
+        { name: "Market", score: 0, description: "Not analyzed" },
+        { name: "Product", score: 0, description: "Not analyzed" },
+        { name: "Traction", score: 0, description: "Not analyzed" },
+        { name: "Moat", score: 0, description: "Not analyzed" }
+      ],
+      overallScore: 0
+    },
+    peerBenchmark: {
+      metrics: [],
+      peerCompanies: [],
+      outperformingCount: 0,
+      percentileRank: 0
+    }
+  };
+}
+
+// === Core Function ===
+async function analyzeStartup(data) {
+  const { startupName = "Unknown Startup", deckText = "", transcriptText = "", publicUrls = [] } = data;
+
+  // Scrape URLs only if provided
+  const scrapedText = await scrapeUrls(publicUrls);
+
+  // If nothing found, still use what user gave
+  const contextText = `
+Startup Name: ${startupName}
+
+Pitch Deck:
+${deckText || "[No pitch deck provided]"}
+
+Founder Transcript:
+${transcriptText || "[No founder transcript provided]"}
+
+Public Data:
+${scrapedText || "[No public data or URLs available]"}
+`;
+
+/**
+ * Analyzes startup data and returns structured insights
+ */
+async function analyzeStartup(data) {
+  // Validate input
+  if (!data || !data.startupName || typeof data.startupName !== 'string' || data.startupName.trim().length === 0) {
+    throw new Error('startupName is required and must be a non-empty string');
+  }
+  
+  const { startupName, deckText, transcriptText, publicUrls } = data;
+  
+  console.log(`🔍 Starting analysis for: ${startupName}`);
+  
+  // Scrape public URLs if provided
+  const scrapedText = await scrapePublicUrls(publicUrls || []);
+  
+  // Prepare the analysis prompt
+  const analysisPrompt = `
+Startup Name: ${startupName}
+
+Return ONLY valid JSON (no markdown or comments) following EXACTLY this schema:
+
+{
+  "summary": "short text summary",
+  "strengths": ["..."],
+  "risks": ["..."],
+  "nextSteps": ["..."],
+  "dealScore": number (0-10),
+  "riskMRI": {
+    "categories": [
+      {"name": "Team", "score": number, "description": "..."},
+      {"name": "Market", "score": number, "description": "..."},
+      {"name": "Product", "score": number, "description": "..."},
+      {"name": "Traction", "score": number, "description": "..."},
+      {"name": "Moat", "score": number, "description": "..."}
+    ],
+    "overallScore": number
+  },
+  "peerBenchmark": {
+    "metrics": [
+      {"name": "Revenue Growth", "company": number, "peers": [numbers], "unit": "%", "higher": true},
+      {"name": "Gross Margin", "company": number, "peers": [numbers], "unit": "%", "higher": true},
+      {"name": "CAC Payback", "company": number, "peers": [numbers], "unit": "months", "higher": false},
+      {"name": "Net Retention", "company": number, "peers": [numbers], "unit": "%", "higher": true}
+    ],
+    "peerCompanies": ["..."],
+    "outperformingCount": number,
+    "percentileRank": number
+  }
+}
+
+Startup Content:
+${contextText}
+`;
+
+  try {
+    // First, try to call the real Gemini API
+    let aiAnalysis = null;
+    try {
+      console.log(`🤖 Calling Gemini API for analysis of: ${startupName}`);
+      console.log(`   Using Vertex AI: ${USE_VERTEX_AI ? 'YES' : 'NO'}`);
+      console.log(`   Project ID: ${GEMINI_PROJECT_ID || 'NOT SET'}`);
+      console.log(`   Location: ${GEMINI_LOCATION || 'NOT SET'}`);
+      console.log(`   API Key: ${GEMINI_API_KEY ? 'SET (hidden)' : 'NOT SET'}`);
+      
+      const aiResponse = await callGeminiAPI(analysisPrompt, ANALYSIS_SYSTEM_PROMPT);
+      
+      // Parse JSON response from AI
+      let jsonText = aiResponse;
+      // Try to extract JSON if wrapped in markdown
+      if (jsonText.includes('```json')) {
+        jsonText = jsonText.substring(jsonText.indexOf('```json') + 7);
+        jsonText = jsonText.substring(0, jsonText.indexOf('```')).trim();
+      } else if (jsonText.includes('```')) {
+        jsonText = jsonText.substring(jsonText.indexOf('```') + 3);
+        jsonText = jsonText.substring(0, jsonText.indexOf('```')).trim();
+      }
+      
+      // Try to parse as JSON
+      try {
+        aiAnalysis = JSON.parse(jsonText);
+        console.log('✅ Successfully received AI analysis from Gemini API');
+      } catch (parseError) {
+        console.warn('⚠️  Failed to parse AI response as JSON, falling back to structured analysis');
+        // If JSON parsing fails, extract structured data from text
+        aiAnalysis = extractAnalysisFromText(aiResponse, startupName);
+      }
+    } catch (apiError) {
+      console.warn('⚠️  Gemini API call failed, falling back to intelligent analysis:', apiError.message);
+      // Fall through to generate intelligent mock analysis
+    }
+    
+    // If we got AI analysis, use it (with fallback enrichment)
+    if (aiAnalysis && (aiAnalysis.summary || aiAnalysis.strengths || aiAnalysis.risks)) {
+      // Enrich with additional metrics analysis
+      const hasDeckText = deckText && deckText.trim().length > 0;
+      const hasTranscript = transcriptText && transcriptText.trim().length > 0;
+      const hasPublicData = scrapedText && scrapedText.trim().length > 0;
+      
+      // Extract metrics for additional analysis components
+      const allContent = (deckText + transcriptText + scrapedText).toLowerCase();
+      const originalContent = deckText + transcriptText + scrapedText;
+      
+      // Extract revenue
+      const revenueMatch = originalContent.match(/\$[\d,]+(?:\.\d+)?[KMB]?/g) || allContent.match(/\$[\d,]+(?:\.\d+)?[kmb]?/g);
+      const revenue = revenueMatch ? revenueMatch[0] : null;
+      const revenueValue = revenue ? parseFloat(revenue.replace(/[$,]/g, '')) : 0;
+      const revenueUnit = revenue ? (revenue.match(/[KMB]/)?.[0] || revenue.match(/[kmb]/)?.[0]) : null;
+      const actualRevenue = revenueUnit === 'K' || revenueUnit === 'k' ? revenueValue * 1000 : 
+                           revenueUnit === 'M' || revenueUnit === 'm' ? revenueValue * 1000000 : 
+                           revenueUnit === 'B' || revenueUnit === 'b' ? revenueValue * 1000000000 : revenueValue;
+      
+      // Extract user count
+      const userMatch = originalContent.match(/(\d+(?:,\d+)*)\s*(?:users|customers|subscribers|active users|vehicles|deliveries)/gi) || 
+                       allContent.match(/(\d+(?:,\d+)*)\s*(?:users|customers|subscribers|active users|vehicles|deliveries)/gi);
+      const users = userMatch ? userMatch[0] : null;
+      const userCount = users ? parseInt(users.replace(/[^\d]/g, '')) : 0;
+      
+      // Extract team size
+      const teamMatch = originalContent.match(/(\d+(?:,\d+)*)\s*(?:people|employees|team members|founders|staff)/gi) || 
+                       allContent.match(/(\d+(?:,\d+)*)\s*(?:people|employees|team members|founders|staff)/gi);
+      const teamSize = teamMatch ? parseInt(teamMatch[0].replace(/[^\d]/g, '')) : 0;
+      
+      // Extract growth rate
+      const growthMatch = allContent.match(/(\d+(?:\.\d+)?%)\s*(?:growth|increase|yoy|mom)/gi);
+      const growthRate = growthMatch ? growthMatch[0] : null;
+      
+      // Extract funding
+      const fundingMatch = allContent.match(/(?:raised|funding|investment|series|round).*?\$[\d,]+(?:K|M|B)?/gi);
+      const funding = fundingMatch ? fundingMatch[0] : null;
+      
+      // Determine industry
+      let industry = "technology";
+      if (allContent.includes("healthcare") || allContent.includes("medical") || allContent.includes("health")) {
+        industry = "healthcare";
+      } else if (allContent.includes("fintech") || allContent.includes("financial") || allContent.includes("payment") || allContent.includes("banking")) {
+        industry = "fintech";
+      } else if (allContent.includes("ecommerce") || allContent.includes("retail") || allContent.includes("marketplace")) {
+        industry = "e-commerce";
+      } else if (allContent.includes("education") || allContent.includes("edtech") || allContent.includes("learning")) {
+        industry = "education";
+      } else if (allContent.includes("saas") || allContent.includes("software") || allContent.includes("platform")) {
+        industry = "SaaS";
+      } else if (allContent.includes("food") || allContent.includes("delivery") || allContent.includes("restaurant")) {
+        industry = "food delivery";
+      }
+      
+      // Add Risk MRI and Peer Benchmark (computed from metrics)
+      const riskMRI = generateRiskMRIAnalysis(industry, actualRevenue, userCount, teamSize, hasDeckText, hasTranscript, hasPublicData, growthRate, funding);
+      const peerBenchmark = generatePeerBenchmarkAnalysis(industry, actualRevenue, userCount, teamSize, actualRevenue, userCount);
+      
+      // Ensure all required fields are present with defaults
+      const result = {
+        summary: aiAnalysis.summary || `Analysis of ${startupName} based on provided materials.`,
+        strengths: Array.isArray(aiAnalysis.strengths) ? aiAnalysis.strengths : (aiAnalysis.strengths ? [aiAnalysis.strengths] : []),
+        risks: Array.isArray(aiAnalysis.risks) ? aiAnalysis.risks : (aiAnalysis.risks ? [aiAnalysis.risks] : []),
+        nextSteps: Array.isArray(aiAnalysis.nextSteps) ? aiAnalysis.nextSteps : (aiAnalysis.nextSteps ? [aiAnalysis.nextSteps] : []),
+        dealScore: typeof aiAnalysis.dealScore === 'number' ? Math.max(0, Math.min(10, aiAnalysis.dealScore)) : 5,
+        riskMRI,
+        peerBenchmark
+      };
+      
+      console.log(`✅ Analysis completed successfully for: ${startupName}`);
+      return result;
+    }
+    
+    // Fallback: Create a sophisticated AI-like analysis based on the actual startup data
+    const hasDeckText = deckText && deckText.trim().length > 0;
+    const hasTranscript = transcriptText && transcriptText.trim().length > 0;
+    const hasPublicData = scrapedText && scrapedText.trim().length > 0;
+    
+    // Extract comprehensive metrics and insights from the input data
+    const allContent = (deckText + transcriptText + scrapedText).toLowerCase();
+    
+    // Revenue and financial metrics - check both original and lowercase content
+    const originalContent = deckText + transcriptText + scrapedText;
+    const revenueMatch = originalContent.match(/\$[\d,]+(?:\.\d+)?[KMB]?/g) || allContent.match(/\$[\d,]+(?:\.\d+)?[kmb]?/g);
+    const revenue = revenueMatch ? revenueMatch[0] : null;
+    const revenueValue = revenue ? parseFloat(revenue.replace(/[$,]/g, '')) : 0;
+    const revenueUnit = revenue ? (revenue.match(/[KMB]/)?.[0] || revenue.match(/[kmb]/)?.[0]) : null;
+    const actualRevenue = revenueUnit === 'K' || revenueUnit === 'k' ? revenueValue * 1000 : 
+                         revenueUnit === 'M' || revenueUnit === 'm' ? revenueValue * 1000000 : 
+                         revenueUnit === 'B' || revenueUnit === 'b' ? revenueValue * 1000000000 : revenueValue;
+    
+    
+    // User metrics - check both original and lowercase content
+    const userMatch = originalContent.match(/(\d+(?:,\d+)*)\s*(?:users|customers|subscribers|active users|vehicles|deliveries)/gi) || 
+                     allContent.match(/(\d+(?:,\d+)*)\s*(?:users|customers|subscribers|active users|vehicles|deliveries)/gi);
+    const users = userMatch ? userMatch[0] : null;
+    const userCount = users ? parseInt(users.replace(/[^\d]/g, '')) : 0;
+    
+    // Team metrics - check both original and lowercase content
+    const teamMatch = originalContent.match(/(\d+(?:,\d+)*)\s*(?:people|employees|team members|founders|staff)/gi) || 
+                     allContent.match(/(\d+(?:,\d+)*)\s*(?:people|employees|team members|founders|staff)/gi);
+    const teamSize = teamMatch ? parseInt(teamMatch[0].replace(/[^\d]/g, '')) : 0;
+    
+    // Growth indicators
+    const growthMatch = allContent.match(/(\d+(?:\.\d+)?%)\s*(?:growth|increase|yoy|mom)/gi);
+    const growthRate = growthMatch ? growthMatch[0] : null;
+    
+    // Funding indicators
+    const fundingMatch = allContent.match(/(?:raised|funding|investment|series|round).*?\$[\d,]+(?:K|M|B)?/gi);
+    const funding = fundingMatch ? fundingMatch[0] : null;
+    
+    // Technology indicators
+    const techKeywords = ['ai', 'machine learning', 'blockchain', 'api', 'saas', 'cloud', 'mobile', 'web', 'platform'];
+    const techStack = techKeywords.filter(tech => allContent.includes(tech));
+    
+    // Market indicators
+    const marketKeywords = ['market', 'total addressable market', 'tam', 'sam', 'som', 'billion', 'trillion'];
+    const marketMention = marketKeywords.some(keyword => allContent.includes(keyword));
+    
+    // Determine industry/sector with more sophistication
+    let industry = "technology";
+    let industryContext = "";
+    if (allContent.includes("healthcare") || allContent.includes("medical") || allContent.includes("health")) {
+      industry = "healthcare";
+      industryContext = "Healthcare technology is experiencing rapid growth with increasing digital adoption and regulatory support.";
+    } else if (allContent.includes("fintech") || allContent.includes("financial") || allContent.includes("payment") || allContent.includes("banking")) {
+      industry = "fintech";
+      industryContext = "Fintech is a highly competitive but lucrative sector with significant regulatory considerations.";
+    } else if (allContent.includes("ecommerce") || allContent.includes("retail") || allContent.includes("marketplace")) {
+      industry = "e-commerce";
+      industryContext = "E-commerce continues to grow with changing consumer behaviors and omnichannel strategies.";
+    } else if (allContent.includes("education") || allContent.includes("edtech") || allContent.includes("learning")) {
+      industry = "education";
+      industryContext = "EdTech is experiencing sustained growth with remote learning and personalized education trends.";
+    } else if (allContent.includes("saas") || allContent.includes("software") || allContent.includes("platform")) {
+      industry = "SaaS";
+      industryContext = "SaaS businesses benefit from recurring revenue models and scalable technology infrastructure.";
+    } else if (allContent.includes("food") || allContent.includes("delivery") || allContent.includes("restaurant")) {
+      industry = "food delivery";
+      industryContext = "Food delivery is a competitive market with high operational complexity and customer acquisition costs.";
+    }
+    
+    // Generate sophisticated analysis
+    const summary = generateSummary(startupName, industry, industryContext, actualRevenue, userCount, teamSize, hasDeckText, hasTranscript, hasPublicData);
+    const strengths = generateStrengths(industry, actualRevenue, userCount, teamSize, growthRate, funding, techStack, marketMention, hasDeckText, hasTranscript, hasPublicData);
+    const risks = generateRisks(industry, actualRevenue, userCount, teamSize, hasDeckText, hasTranscript, hasPublicData);
+    const nextSteps = generateNextSteps(industry, hasDeckText, hasTranscript, hasPublicData, actualRevenue, userCount);
+    const dealScore = calculateDealScore(actualRevenue, userCount, teamSize, hasDeckText, hasTranscript, hasPublicData, growthRate, funding);
+    
+    // Generate Risk MRI Analysis
+    const riskMRI = generateRiskMRIAnalysis(industry, actualRevenue, userCount, teamSize, hasDeckText, hasTranscript, hasPublicData, growthRate, funding);
+    
+    // Generate Peer Benchmark Analysis
+    const peerBenchmark = generatePeerBenchmarkAnalysis(industry, actualRevenue, userCount, teamSize, actualRevenue, userCount);
+    
+    const mockAnalysisResult = {
+      summary,
+      strengths,
+      risks,
+      nextSteps,
+      dealScore,
+      riskMRI,
+      peerBenchmark
+    };
+    
+    console.log(`✅ Fallback analysis completed for: ${startupName} (using intelligent mock analysis)`);
+    return mockAnalysisResult;
+    
+  } catch (error) {
+    console.error('❌ Analysis error:', error);
+    
+    // Extract basic info even on error for partial results
+    const hasDeckText = deckText && deckText.trim().length > 0;
+    const hasTranscript = transcriptText && transcriptText.trim().length > 0;
+    const hasPublicData = scrapedText && scrapedText.trim().length > 0;
+    const allContent = ((deckText || '') + (transcriptText || '') + (scrapedText || '')).toLowerCase();
+    
+    // Try to extract basic metrics even on error
+    const originalContent = (deckText || '') + (transcriptText || '') + (scrapedText || '');
+    const revenueMatch = originalContent.match(/\$[\d,]+(?:\.\d+)?[KMB]?/g);
+    const revenue = revenueMatch ? revenueMatch[0] : null;
+    const revenueValue = revenue ? parseFloat(revenue.replace(/[$,]/g, '')) : 0;
+    const revenueUnit = revenue ? (revenue.match(/[KMB]/)?.[0] || revenue.match(/[kmb]/)?.[0]) : null;
+    const actualRevenue = revenueUnit === 'K' || revenueUnit === 'k' ? revenueValue * 1000 : 
+                         revenueUnit === 'M' || revenueUnit === 'm' ? revenueValue * 1000000 : 
+                         revenueUnit === 'B' || revenueUnit === 'b' ? revenueValue * 1000000000 : revenueValue;
+    
+    const userMatch = originalContent.match(/(\d+(?:,\d+)*)\s*(?:users|customers|subscribers|active users)/gi);
+    const users = userMatch ? userMatch[0] : null;
+    const userCount = users ? parseInt(users.replace(/[^\d]/g, '')) : 0;
+    
+    const teamMatch = originalContent.match(/(\d+(?:,\d+)*)\s*(?:people|employees|team members|founders|staff)/gi);
+    const teamSize = teamMatch ? parseInt(teamMatch[0].replace(/[^\d]/g, '')) : 0;
+    
+    const growthMatch = allContent.match(/(\d+(?:\.\d+)?%)\s*(?:growth|increase|yoy|mom)/gi);
+    const growthRate = growthMatch ? growthMatch[0] : null;
+    const fundingMatch = allContent.match(/(?:raised|funding|investment|series|round).*?\$[\d,]+(?:K|M|B)?/gi);
+    const funding = fundingMatch ? fundingMatch[0] : null;
+    
+    let industry = "technology";
+    if (allContent.includes("healthcare") || allContent.includes("medical")) {
+      industry = "healthcare";
+    } else if (allContent.includes("fintech") || allContent.includes("financial")) {
+      industry = "fintech";
+    } else if (allContent.includes("saas") || allContent.includes("software")) {
+      industry = "SaaS";
+    }
+    
+    // Generate minimal risk MRI and peer benchmark even on error
+    const riskMRI = generateRiskMRIAnalysis(industry, actualRevenue, userCount, teamSize, hasDeckText, hasTranscript, hasPublicData, growthRate, funding);
+    const peerBenchmark = generatePeerBenchmarkAnalysis(industry, actualRevenue, userCount, teamSize, actualRevenue, userCount);
+    
+    // Return fallback response with required structure
+    return {
+      summary: `Analysis encountered an error for ${startupName}. ${error.message}. Partial analysis available based on available data.`,
+      strengths: ["Unable to assess strengths due to processing error"],
+      risks: ["Analysis unavailable - error occurred during processing"],
+      nextSteps: ["Retry analysis", "Contact support if issue persists", "Verify input data format"],
+      dealScore: 0,
+      riskMRI: riskMRI || {
+        categories: [],
+        overallScore: 0
+      },
+      peerBenchmark: peerBenchmark || {
+        metrics: [],
+        peerCompanies: [],
+        outperformingCount: 0,
+        percentileRank: 0
+      }
+    };
+  }
+}
+
+/**
+ * Generate intelligent chat responses based on user questions
+ */
+function generateIntelligentChatResponse(userQuestion, conversationHistory, contextData) {
+  const question = userQuestion.toLowerCase();
+  
+  // Investment and analysis questions
+  if (question.includes('investment') || question.includes('invest') || question.includes('funding')) {
+    return "Based on the startup analysis, I'd recommend focusing on the key metrics that matter most: revenue growth, user acquisition costs, and market size. The deal score and risk assessment provide a good starting point, but you'll want to dive deeper into the unit economics and competitive positioning before making an investment decision.";
+  }
+  
+  if (question.includes('risk') || question.includes('risks')) {
+    return "The risk assessment highlights several key areas to monitor: market competition, execution challenges, and data completeness. I'd suggest conducting additional due diligence on the areas marked as high-risk, particularly around team capabilities and market validation.";
+  }
+  
+  if (question.includes('strength') || question.includes('strengths')) {
+    return "The identified strengths show promising indicators for this startup. Focus on how these strengths create competitive advantages and sustainable moats. The revenue metrics and user traction are particularly encouraging signs of product-market fit.";
+  }
+  
+  if (question.includes('next step') || question.includes('due diligence')) {
+    return "The next steps outline a comprehensive due diligence process. I'd prioritize the financial analysis and competitive positioning first, as these will give you the clearest picture of the investment opportunity. Don't forget to validate the technical architecture and scalability plans.";
+  }
+  
+  if (question.includes('score') || question.includes('rating')) {
+    return "The deal score is calculated based on multiple factors including revenue, user base, team size, and data quality. A score above 7 indicates strong potential, while scores below 5 suggest significant risks. Remember that this is just one data point in your overall investment decision.";
+  }
+  
+  if (question.includes('market') || question.includes('competition')) {
+    return "Market analysis is crucial for understanding the competitive landscape. Look at the total addressable market size, growth rate, and key competitors. The industry context provided in the analysis gives you a good starting point, but you'll want to conduct deeper market research.";
+  }
+  
+  if (question.includes('team') || question.includes('founder')) {
+    return "Team assessment is one of the most important factors in early-stage investing. The analysis shows team size and experience level, but you'll want to conduct founder interviews to understand their vision, execution capability, and market knowledge. Look for complementary skills and previous startup experience.";
+  }
+  
+  if (question.includes('revenue') || question.includes('financial')) {
+    return "Financial analysis is critical for understanding the business model and growth potential. The revenue metrics shown in the analysis provide a good starting point, but you'll want to dive deeper into unit economics, customer acquisition costs, and lifetime value. Look for recurring revenue models and scalable growth strategies.";
+  }
+  
+  if (question.includes('technology') || question.includes('tech')) {
+    return "Technology assessment helps understand the technical feasibility and scalability of the solution. Look at the tech stack, architecture decisions, and development team capabilities. Consider how the technology creates competitive advantages and barriers to entry.";
+  }
+  
+  if (question.includes('help') || question.includes('how')) {
+    return "I'm here to help you analyze startup investment opportunities. I can discuss the analysis results, explain key metrics, provide due diligence guidance, and answer questions about investment strategy. What specific aspect of the startup analysis would you like to explore?";
+  }
+  
+  // Default response for other questions
+  return "That's an interesting question about startup analysis. Based on the data we have, I'd recommend focusing on the key metrics and risk factors identified in the analysis. Could you be more specific about what aspect of the investment opportunity you'd like to discuss? I can help with market analysis, financial metrics, team assessment, or due diligence guidance.";
+}
+
+    // Merge with defaults to ensure all keys are present
+    const finalOutput = {
+      ...getDefaultResponse(),
+      ...parsed,
+      riskMRI: { ...getDefaultResponse().riskMRI, ...parsed.riskMRI },
+      peerBenchmark: { ...getDefaultResponse().peerBenchmark, ...parsed.peerBenchmark }
+    };
+
+    return finalOutput;
+  } catch (err) {
+    console.error("Gemini API Error:", err.response?.data || err.message);
+    return { error: "Analysis failed", details: err.response?.data || err.message };
+  }
+}
+
+module.exports = { analyzeStartup };
